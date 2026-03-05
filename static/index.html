@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Parakeet Transcription</title>
+  <link rel="stylesheet" href="https://unpkg.com/@knadh/oat/oat.min.css">
+  <script src="https://unpkg.com/@knadh/oat/oat.min.js" defer></script>
+  <style>
+    body {
+      max-width: 860px;
+      margin: 0 auto;
+      padding: 1.5rem;
+    }
+
+    #result {
+      white-space: pre-wrap;
+      word-break: break-word;
+      min-height: 10rem;
+    }
+
+    .controls {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 0.8rem;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Parakeet Transcription API</h1>
+    <p>Upload an audio file and test <code>/v1/audio/transcriptions</code> from your browser.</p>
+  </header>
+
+  <article class="card">
+    <form id="transcribe-form">
+      <label data-field>
+        Audio file
+        <input id="audio-file" name="file" type="file" accept="audio/*" required>
+      </label>
+
+      <div class="controls">
+        <label data-field>
+          Model
+          <input name="model" value="whisper-1" required>
+        </label>
+
+        <label data-field>
+          Response format
+          <select name="response_format">
+            <option value="json" selected>json</option>
+            <option value="text">text</option>
+            <option value="srt">srt</option>
+            <option value="vtt">vtt</option>
+            <option value="verbose_json">verbose_json</option>
+          </select>
+        </label>
+
+        <label data-field>
+          Language
+          <input name="language" value="en" maxlength="8" placeholder="en">
+        </label>
+      </div>
+
+      <menu class="buttons">
+        <li><button id="submit-btn" type="submit">Transcribe</button></li>
+        <li><button id="reset-btn" type="button" class="outline">Clear</button></li>
+      </menu>
+    </form>
+  </article>
+
+  <article class="card">
+    <header>
+      <h3>Result</h3>
+    </header>
+    <pre id="result">No request yet.</pre>
+  </article>
+
+  <script>
+    const form = document.getElementById("transcribe-form");
+    const result = document.getElementById("result");
+    const submitBtn = document.getElementById("submit-btn");
+    const resetBtn = document.getElementById("reset-btn");
+
+    const setLoading = (loading) => {
+      submitBtn.disabled = loading;
+      submitBtn.setAttribute("aria-busy", loading ? "true" : "false");
+      submitBtn.textContent = loading ? "Transcribing..." : "Transcribe";
+    };
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+
+      const fileInput = document.getElementById("audio-file");
+      if (!fileInput.files || fileInput.files.length === 0) {
+        ot.toast("Please select an audio file", "Missing file", { variant: "warning" });
+        return;
+      }
+
+      const body = new FormData(form);
+      setLoading(true);
+      result.textContent = "Sending request...";
+
+      try {
+        const response = await fetch("/v1/audio/transcriptions", {
+          method: "POST",
+          body
+        });
+
+        const contentType = response.headers.get("content-type") || "";
+        const raw = await response.text();
+
+        if (!response.ok) {
+          result.textContent = raw;
+          ot.toast("Transcription request failed", "Error", { variant: "danger" });
+          return;
+        }
+
+        if (contentType.includes("application/json")) {
+          try {
+            const parsed = JSON.parse(raw);
+            result.textContent = JSON.stringify(parsed, null, 2);
+          } catch {
+            result.textContent = raw;
+          }
+        } else {
+          result.textContent = raw;
+        }
+
+        ot.toast("Transcription complete", "Success", { variant: "success" });
+      } catch (error) {
+        result.textContent = `Network error: ${error}`;
+        ot.toast("Could not reach server", "Network error", { variant: "danger" });
+      } finally {
+        setLoading(false);
+      }
+    });
+
+    resetBtn.addEventListener("click", () => {
+      form.reset();
+      result.textContent = "No request yet.";
+    });
+  </script>
+</body>
+</html>

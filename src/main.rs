@@ -6,10 +6,11 @@ use futures_util::StreamExt;
 use once_cell::sync::Lazy;
 use rocket::catch;
 use rocket::data::Data;
+use rocket::fs::NamedFile;
 use rocket::http::ContentType;
 use rocket::serde::json::Json;
 use rocket::serde::Serialize;
-use rocket::{launch, post, routes, Build, Rocket};
+use rocket::{get, launch, post, routes, Build, Rocket};
 use rocket_multipart_form_data::{
     MultipartFormData, MultipartFormDataField, MultipartFormDataOptions,
 };
@@ -214,6 +215,11 @@ async fn transcribe(
         transcription.text,
         transcription.segments,
     ))
+}
+
+#[get("/")]
+async fn index() -> Option<NamedFile> {
+    NamedFile::open("static/index.html").await.ok()
 }
 
 async fn ensure_model_present() -> Result<PathBuf, String> {
@@ -567,6 +573,6 @@ fn internal_error() -> Json<OpenAiErrorResponse> {
 fn rocket() -> Rocket<Build> {
     env_logger::init();
     rocket::build()
-        .mount("/", routes![transcribe])
+        .mount("/", routes![index, transcribe])
         .register("/", rocket::catchers![bad_request, internal_error])
 }
