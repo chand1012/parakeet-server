@@ -25,6 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libstdc++6 \
     libgomp1 \
     ca-certificates \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd -g 1000 parakeet \
     && useradd -u 1000 -g 1000 -m -d /home/parakeet parakeet

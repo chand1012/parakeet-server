@@ -1,5 +1,6 @@
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Mutex;
 
 use futures_util::StreamExt;
@@ -162,11 +163,17 @@ async fn transcribe(
         .and_then(|ext| ext.to_str())
         .map(|s| s.to_lowercase());
 
-    let decoded =
+    let decoded = if extension.as_deref() == Some("wav") {
         decode_audio_to_mono_f32(&file_field.raw, extension.as_deref()).map_err(|err| {
             log::error!("audio decode failed: {err}");
             rocket::http::Status::BadRequest
-        })?;
+        })?
+    } else {
+        convert_via_ffmpeg(&file_field.raw).await.map_err(|err| {
+            log::error!("ffmpeg conversion failed: {err}");
+            rocket::http::Status::BadRequest
+        })?
+    };
 
     let samples = if decoded.sample_rate == TARGET_SAMPLE_RATE {
         decoded.samples
@@ -280,6 +287,66 @@ async fn ensure_model_present() -> Result<PathBuf, String> {
 struct DecodedAudio {
     samples: Vec<f32>,
     sample_rate: u32,
+}
+
+async fn convert_via_ffmpeg(bytes: &[u8]) -> Result<DecodedAudio, String> {
+    let mut child = tokio::process::Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            "pipe:0",
+            "-f",
+            "f32le",
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            "pipe:1",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("failed to spawn ffmpeg: {err}"))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(bytes)
+            .await
+            .map_err(|err| format!("write to ffmpeg stdin failed: {err}"))?;
+        // drop stdin to close the pipe and signal EOF to ffmpeg
+    }
+
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|err| format!("ffmpeg wait failed: {err}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ffmpeg failed: {stderr}"));
+    }
+
+    let raw = output.stdout;
+    if raw.len() % 4 != 0 {
+        return Err("ffmpeg output byte length is not a multiple of 4".to_string());
+    }
+
+    let samples: Vec<f32> = raw
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+
+    if samples.is_empty() {
+        return Err("ffmpeg produced no audio samples".to_string());
+    }
+
+    Ok(DecodedAudio {
+        samples,
+        sample_rate: TARGET_SAMPLE_RATE,
+    })
 }
 
 fn decode_audio_to_mono_f32(bytes: &[u8], extension: Option<&str>) -> Result<DecodedAudio, String> {
