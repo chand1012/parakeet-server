@@ -36,6 +36,7 @@ ENV LD_LIBRARY_PATH=/opt/onnxruntime/lib
 COPY --from=builder /build/target/release/parakeet-server /usr/local/bin/
 COPY --from=builder /build/onnxruntime-lib /opt/onnxruntime/lib
 COPY --from=builder /build/static static
+COPY Rocket.toml .
 
 RUN chown -R parakeet:parakeet /home/parakeet
 
