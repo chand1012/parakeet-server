@@ -1,9 +1,9 @@
+use parakeet_server::model_archive::ensure_model_present;
 use std::io::Cursor;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::Mutex;
 
-use futures_util::StreamExt;
 use once_cell::sync::Lazy;
 use rocket::catch;
 use rocket::data::Data;
@@ -30,30 +30,6 @@ use transcribe_rs::engines::parakeet::{
 use transcribe_rs::{TranscriptionEngine, TranscriptionSegment};
 
 const TARGET_SAMPLE_RATE: u32 = 16_000;
-const MODEL_DIR: &str = "models/parakeet-tdt-0.6b-v3-int8";
-
-const MODEL_FILES: [(&str, &str); 5] = [
-    (
-        "encoder-model.int8.onnx",
-        "https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3/resolve/main/encoder-model.int8.onnx",
-    ),
-    (
-        "decoder_joint-model.int8.onnx",
-        "https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3/resolve/main/decoder_joint-model.int8.onnx",
-    ),
-    (
-        "nemo128.onnx",
-        "https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3/resolve/main/nemo128.onnx",
-    ),
-    (
-        "vocab.txt",
-        "https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3/resolve/main/vocab.txt",
-    ),
-    (
-        "config.json",
-        "https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3/resolve/main/config.json",
-    ),
-];
 
 static ENGINE_STATE: Lazy<Mutex<EngineState>> = Lazy::new(|| {
     Mutex::new(EngineState {
@@ -227,61 +203,6 @@ async fn transcribe(
 #[get("/")]
 async fn index() -> Option<NamedFile> {
     NamedFile::open("static/index.html").await.ok()
-}
-
-async fn ensure_model_present() -> Result<PathBuf, String> {
-    let model_dir = PathBuf::from(MODEL_DIR);
-    tokio::fs::create_dir_all(&model_dir)
-        .await
-        .map_err(|err| format!("failed to create model dir: {err}"))?;
-
-    let client = reqwest::Client::builder()
-        .build()
-        .map_err(|err| format!("failed to create http client: {err}"))?;
-
-    for (file_name, url) in MODEL_FILES {
-        let file_path = model_dir.join(file_name);
-        if tokio::fs::try_exists(&file_path)
-            .await
-            .map_err(|err| format!("failed to stat model file {}: {err}", file_path.display()))?
-        {
-            continue;
-        }
-
-        log::info!("downloading missing model file {}", file_name);
-
-        let tmp_file = file_path.with_extension("part");
-        let response = client
-            .get(url)
-            .send()
-            .await
-            .map_err(|err| format!("download failed for {file_name}: {err}"))?
-            .error_for_status()
-            .map_err(|err| format!("bad response for {file_name}: {err}"))?;
-
-        let mut out = tokio::fs::File::create(&tmp_file)
-            .await
-            .map_err(|err| format!("failed to create {}: {err}", tmp_file.display()))?;
-
-        let mut stream = response.bytes_stream();
-        while let Some(chunk_result) = stream.next().await {
-            let chunk =
-                chunk_result.map_err(|err| format!("stream read failed for {file_name}: {err}"))?;
-            out.write_all(&chunk)
-                .await
-                .map_err(|err| format!("write failed for {}: {err}", tmp_file.display()))?;
-        }
-
-        out.flush()
-            .await
-            .map_err(|err| format!("flush failed for {}: {err}", tmp_file.display()))?;
-
-        tokio::fs::rename(&tmp_file, &file_path)
-            .await
-            .map_err(|err| format!("rename failed to {}: {err}", file_path.display()))?;
-    }
-
-    Ok(model_dir)
 }
 
 struct DecodedAudio {
