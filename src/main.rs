@@ -1,12 +1,14 @@
+use parakeet_server::model_archive::{ensure_model_present, model_dir};
 use std::io::Cursor;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::Mutex;
+use std::time::Instant;
 
-use futures_util::StreamExt;
 use once_cell::sync::Lazy;
 use rocket::catch;
 use rocket::data::Data;
+use rocket::fairing::AdHoc;
 use rocket::fs::NamedFile;
 use rocket::http::ContentType;
 use rocket::serde::json::Json;
@@ -30,30 +32,6 @@ use transcribe_rs::engines::parakeet::{
 use transcribe_rs::{TranscriptionEngine, TranscriptionSegment};
 
 const TARGET_SAMPLE_RATE: u32 = 16_000;
-const MODEL_DIR: &str = "models/parakeet-tdt-0.6b-v3-int8";
-
-const MODEL_FILES: [(&str, &str); 5] = [
-    (
-        "encoder-model.int8.onnx",
-        "https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3/resolve/main/encoder-model.int8.onnx",
-    ),
-    (
-        "decoder_joint-model.int8.onnx",
-        "https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3/resolve/main/decoder_joint-model.int8.onnx",
-    ),
-    (
-        "nemo128.onnx",
-        "https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3/resolve/main/nemo128.onnx",
-    ),
-    (
-        "vocab.txt",
-        "https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3/resolve/main/vocab.txt",
-    ),
-    (
-        "config.json",
-        "https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3/resolve/main/config.json",
-    ),
-];
 
 static ENGINE_STATE: Lazy<Mutex<EngineState>> = Lazy::new(|| {
     Mutex::new(EngineState {
@@ -108,6 +86,12 @@ async fn transcribe(
     content_type: &ContentType,
     data: Data<'_>,
 ) -> Result<(ContentType, String), rocket::http::Status> {
+    let request_started = Instant::now();
+    log::info!(
+        "received transcription request: content_type={}",
+        content_type
+    );
+
     let mut options = MultipartFormDataOptions::new();
     options
         .allowed_fields
@@ -151,10 +135,21 @@ async fn transcribe(
         .unwrap_or("en")
         .to_string();
 
-    let model_dir = ensure_model_present().await.map_err(|err| {
-        log::error!("model preparation failed: {err}");
-        rocket::http::Status::InternalServerError
-    })?;
+    let file_name = file_field
+        .file_name
+        .clone()
+        .unwrap_or_else(|| "upload.bin".to_string());
+    let upload_size = file_field.raw.len();
+    log::info!(
+        "parsed transcription request: file_name={}, bytes={}, response_format={}, language={}",
+        file_name,
+        upload_size,
+        response_format,
+        language
+    );
+
+    let model_dir = model_dir();
+    log::info!("model files ready at {}", model_dir.display());
 
     let extension = file_field
         .file_name
@@ -162,26 +157,49 @@ async fn transcribe(
         .and_then(|name| Path::new(name).extension())
         .and_then(|ext| ext.to_str())
         .map(|s| s.to_lowercase());
+    log::info!(
+        "preparing audio input: file_name={}, extension={}",
+        file_name,
+        extension.as_deref().unwrap_or("unknown")
+    );
 
     let decoded = if extension.as_deref() == Some("wav") {
+        log::info!("decoding wav input directly with symphonia");
         decode_audio_to_mono_f32(&file_field.raw, extension.as_deref()).map_err(|err| {
             log::error!("audio decode failed: {err}");
             rocket::http::Status::BadRequest
         })?
     } else {
+        log::info!("converting input to mono 16kHz wav via ffmpeg");
         convert_via_ffmpeg(&file_field.raw).await.map_err(|err| {
             log::error!("ffmpeg conversion failed: {err}");
             rocket::http::Status::BadRequest
         })?
     };
+    log::info!(
+        "decoded audio: sample_rate={}, samples={}",
+        decoded.sample_rate,
+        decoded.samples.len()
+    );
 
     let samples = if decoded.sample_rate == TARGET_SAMPLE_RATE {
+        log::info!("input already at target sample rate {}", TARGET_SAMPLE_RATE);
         decoded.samples
     } else {
+        log::info!(
+            "resampling audio from {}Hz to {}Hz",
+            decoded.sample_rate,
+            TARGET_SAMPLE_RATE
+        );
         resample_linear(&decoded.samples, decoded.sample_rate, TARGET_SAMPLE_RATE)
     };
 
     let duration = samples.len() as f64 / TARGET_SAMPLE_RATE as f64;
+    log::info!(
+        "running transcription: duration_seconds={:.2}, sample_count={}",
+        duration,
+        samples.len()
+    );
 
     let transcription = tokio::task::spawn_blocking(move || {
         let mut state = ENGINE_STATE
@@ -189,11 +207,15 @@ async fn transcribe(
             .map_err(|_| "engine lock poisoned".to_string())?;
 
         if !state.model_loaded {
+            log::info!("loading parakeet model into inference engine");
             state
                 .engine
                 .load_model_with_params(&model_dir, ParakeetModelParams::int8())
                 .map_err(|err| format!("failed to load parakeet model: {err}"))?;
             state.model_loaded = true;
+            log::info!("parakeet model loaded successfully");
+        } else {
+            log::info!("reusing already loaded parakeet model");
         }
 
         let params = ParakeetInferenceParams {
@@ -215,6 +237,17 @@ async fn transcribe(
         rocket::http::Status::InternalServerError
     })?;
 
+    log::info!(
+        "transcription complete: text_bytes={}, segments={}, elapsed_ms={}",
+        transcription.text.len(),
+        transcription
+            .segments
+            .as_ref()
+            .map(|segments| segments.len())
+            .unwrap_or(0),
+        request_started.elapsed().as_millis()
+    );
+
     Ok(format_openai_response(
         response_format,
         &language,
@@ -227,61 +260,6 @@ async fn transcribe(
 #[get("/")]
 async fn index() -> Option<NamedFile> {
     NamedFile::open("static/index.html").await.ok()
-}
-
-async fn ensure_model_present() -> Result<PathBuf, String> {
-    let model_dir = PathBuf::from(MODEL_DIR);
-    tokio::fs::create_dir_all(&model_dir)
-        .await
-        .map_err(|err| format!("failed to create model dir: {err}"))?;
-
-    let client = reqwest::Client::builder()
-        .build()
-        .map_err(|err| format!("failed to create http client: {err}"))?;
-
-    for (file_name, url) in MODEL_FILES {
-        let file_path = model_dir.join(file_name);
-        if tokio::fs::try_exists(&file_path)
-            .await
-            .map_err(|err| format!("failed to stat model file {}: {err}", file_path.display()))?
-        {
-            continue;
-        }
-
-        log::info!("downloading missing model file {}", file_name);
-
-        let tmp_file = file_path.with_extension("part");
-        let response = client
-            .get(url)
-            .send()
-            .await
-            .map_err(|err| format!("download failed for {file_name}: {err}"))?
-            .error_for_status()
-            .map_err(|err| format!("bad response for {file_name}: {err}"))?;
-
-        let mut out = tokio::fs::File::create(&tmp_file)
-            .await
-            .map_err(|err| format!("failed to create {}: {err}", tmp_file.display()))?;
-
-        let mut stream = response.bytes_stream();
-        while let Some(chunk_result) = stream.next().await {
-            let chunk =
-                chunk_result.map_err(|err| format!("stream read failed for {file_name}: {err}"))?;
-            out.write_all(&chunk)
-                .await
-                .map_err(|err| format!("write failed for {}: {err}", tmp_file.display()))?;
-        }
-
-        out.flush()
-            .await
-            .map_err(|err| format!("flush failed for {}: {err}", tmp_file.display()))?;
-
-        tokio::fs::rename(&tmp_file, &file_path)
-            .await
-            .map_err(|err| format!("rename failed to {}: {err}", file_path.display()))?;
-    }
-
-    Ok(model_dir)
 }
 
 struct DecodedAudio {
@@ -311,23 +289,44 @@ async fn convert_via_ffmpeg(bytes: &[u8]) -> Result<DecodedAudio, String> {
         .spawn()
         .map_err(|err| format!("failed to spawn ffmpeg: {err}"))?;
 
-    if let Some(mut stdin) = child.stdin.take() {
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "failed to acquire ffmpeg stdin".to_string())?;
+    let input = bytes.to_vec();
+    let stdin_task = tokio::spawn(async move {
         stdin
-            .write_all(bytes)
+            .write_all(&input)
             .await
             .map_err(|err| format!("write to ffmpeg stdin failed: {err}"))?;
-        // drop stdin to close the pipe and signal EOF to ffmpeg
-    }
+        stdin
+            .shutdown()
+            .await
+            .map_err(|err| format!("failed to close ffmpeg stdin: {err}"))
+    });
 
     let output = child
         .wait_with_output()
         .await
         .map_err(|err| format!("ffmpeg wait failed: {err}"))?;
+    let stdin_result = stdin_task
+        .await
+        .map_err(|err| format!("ffmpeg stdin task failed: {err}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ffmpeg failed: {stderr}"));
+        return match stdin_result {
+            Ok(()) => Err(format!("ffmpeg failed: {stderr}")),
+            Err(stdin_err) if stderr.trim().is_empty() => {
+                Err(format!("ffmpeg failed and stdin write failed: {stdin_err}"))
+            }
+            Err(stdin_err) => Err(format!(
+                "ffmpeg failed: {stderr}; stdin write also failed: {stdin_err}"
+            )),
+        };
     }
+
+    stdin_result?;
 
     let raw = output.stdout;
     if raw.len() % 4 != 0 {
@@ -638,8 +637,28 @@ fn internal_error() -> Json<OpenAiErrorResponse> {
 
 #[launch]
 fn rocket() -> Rocket<Build> {
-    env_logger::init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    log::info!("starting parakeet-server with default log level info");
     rocket::build()
+        .attach(AdHoc::try_on_ignite(
+            "Prepare model archive",
+            |rocket| async move {
+                log::info!("ensuring parakeet model is present during startup");
+                match ensure_model_present().await {
+                    Ok(model_dir) => {
+                        log::info!(
+                            "startup model preparation complete: {}",
+                            model_dir.display()
+                        );
+                        Ok(rocket)
+                    }
+                    Err(err) => {
+                        log::error!("startup model preparation failed: {err}");
+                        Err(rocket)
+                    }
+                }
+            },
+        ))
         .mount("/", routes![index, transcribe])
         .register("/", rocket::catchers![bad_request, internal_error])
 }

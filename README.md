@@ -6,7 +6,7 @@ A self-hosted, OpenAI-compatible speech-to-text API server powered by NVIDIA's [
 
 - **OpenAI Whisper API compatible** — works with existing clients (e.g. `openai-python`, `whisper.cpp` clients, etc.)
 - **Multiple output formats** — `json`, `text`, `srt`, `vtt`, `verbose_json`
-- **Automatic model download** — model files fetched from HuggingFace on first run, no manual setup
+- **Automatic model download** — model archive fetched and extracted automatically on first run, no manual setup
 - **Browser UI** — built-in web interface for quick testing at `http://localhost:8000`
 - **Efficient inference** — INT8 quantized ONNX model via ONNX Runtime
 - **Supports many audio formats** — MP3, WAV, FLAC, OGG, and more (via Symphonia)
@@ -122,7 +122,7 @@ Uses the **NVIDIA Parakeet TDT 0.6B v3** model (INT8 quantized):
 | Input | 16 kHz mono audio (auto-resampled) |
 | Source | [nvidia/parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) |
 
-Model files are stored in `models/parakeet-tdt-0.6b-v3-int8/` and downloaded automatically on first use.
+Model files are stored in `models/parakeet-tdt-0.6b-v3-int8/` and extracted automatically from `https://blob.handy.computer/parakeet-v3-int8.tar.gz` on first use.
 
 ## Configuration
 
