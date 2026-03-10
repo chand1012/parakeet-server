@@ -1,6 +1,7 @@
 use flate2::read::GzDecoder;
 use futures_util::StreamExt;
-use std::path::{Path, PathBuf};
+use std::collections::VecDeque;
+use std::path::{Component, Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 
 const MODEL_DIR: &str = "models/parakeet-tdt-0.6b-v3-int8";
@@ -120,12 +121,42 @@ fn extract_model_archive(archive_path: &Path, extract_dir: &Path) -> Result<(), 
         .map_err(|err| format!("failed to open {}: {err}", archive_path.display()))?;
     let decoder = GzDecoder::new(archive);
     let mut tar = tar::Archive::new(decoder);
-    tar.unpack(extract_dir).map_err(|err| {
-        format!(
-            "failed to extract archive into {}: {err}",
-            extract_dir.display()
-        )
-    })
+    tar.set_preserve_permissions(false);
+    tar.set_unpack_xattrs(false);
+
+    let entries = tar
+        .entries()
+        .map_err(|err| format!("failed to read archive entries: {err}"))?;
+
+    for entry in entries {
+        let mut entry = entry.map_err(|err| format!("failed to read archive entry: {err}"))?;
+        let relative_path = sanitized_archive_path(
+            &entry
+                .path()
+                .map_err(|err| format!("failed to read archive entry path: {err}"))?,
+        )?;
+        if relative_path.as_os_str().is_empty() {
+            continue;
+        }
+
+        let destination = extract_dir.join(relative_path);
+        if entry.header().entry_type().is_dir() {
+            std::fs::create_dir_all(&destination)
+                .map_err(|err| format!("failed to create {}: {err}", destination.display()))?;
+            continue;
+        }
+
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+        }
+
+        entry
+            .unpack(&destination)
+            .map_err(|err| format!("failed to unpack {}: {err}", destination.display()))?;
+    }
+
+    Ok(())
 }
 
 fn install_model_files(extract_dir: &Path, model_dir: &Path) -> Result<(), String> {
@@ -136,7 +167,18 @@ fn install_model_files(extract_dir: &Path, model_dir: &Path) -> Result<(), Strin
     for file_name in MODEL_FILES {
         let source_path = source_dir.join(file_name);
         let destination_path = model_dir.join(file_name);
-        let tmp_path = destination_path.with_extension("part");
+        let tmp_path = destination_path.with_file_name(format!(
+            "{}.part",
+            destination_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| {
+                    format!(
+                        "failed to derive temporary file name for {}",
+                        destination_path.display()
+                    )
+                })?
+        ));
         std::fs::copy(&source_path, &tmp_path).map_err(|err| {
             format!(
                 "failed to copy {} to {}: {err}",
@@ -157,9 +199,9 @@ fn install_model_files(extract_dir: &Path, model_dir: &Path) -> Result<(), Strin
 }
 
 fn find_model_root(root: &Path) -> Result<PathBuf, String> {
-    let mut pending = vec![root.to_path_buf()];
+    let mut pending = VecDeque::from([root.to_path_buf()]);
 
-    while let Some(path) = pending.pop() {
+    while let Some(path) = pending.pop_front() {
         if MODEL_FILES
             .iter()
             .all(|file_name| path.join(file_name).is_file())
@@ -173,7 +215,7 @@ fn find_model_root(root: &Path) -> Result<PathBuf, String> {
             let entry = entry.map_err(|err| format!("failed to read extracted entry: {err}"))?;
             let child = entry.path();
             if child.is_dir() {
-                pending.push(child);
+                pending.push_back(child);
             }
         }
     }
@@ -184,9 +226,31 @@ fn find_model_root(root: &Path) -> Result<PathBuf, String> {
     ))
 }
 
+fn sanitized_archive_path(path: &Path) -> Result<PathBuf, String> {
+    let mut sanitized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => sanitized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(format!(
+                    "refusing to extract suspicious archive path {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    Ok(sanitized)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{extract_model_archive, install_model_files, MODEL_FILES};
+    use super::{
+        extract_model_archive, find_model_root, install_model_files, model_files_present,
+        MODEL_FILES,
+    };
     use flate2::write::GzEncoder;
     use flate2::Compression;
     use std::fs;
@@ -196,7 +260,7 @@ mod tests {
     fn installs_model_files_from_nested_archive_directory() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("system clock should be after unix epoch")
             .as_nanos();
         let root = std::env::temp_dir().join(format!("parakeet-server-test-{unique}"));
         let archive_path = root.join("model.tar.gz");
@@ -229,6 +293,81 @@ mod tests {
             let installed = fs::read_to_string(model_dir.join(file_name)).unwrap();
             assert_eq!(installed, format!("test contents for {file_name}"));
         }
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn finds_model_files_at_archive_root() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("parakeet-server-test-root-{unique}"));
+
+        fs::create_dir_all(&root).unwrap();
+
+        for file_name in MODEL_FILES {
+            fs::write(root.join(file_name), format!("contents for {file_name}")).unwrap();
+        }
+
+        let found = find_model_root(&root).unwrap();
+        assert_eq!(found, root);
+
+        fs::remove_dir_all(&found).unwrap();
+    }
+
+    #[test]
+    fn errors_when_archive_is_missing_required_model_files() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("parakeet-server-test-missing-{unique}"));
+
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("unexpected.txt"), "not a model").unwrap();
+
+        let error = find_model_root(&root).unwrap_err();
+        assert!(error.contains("model archive did not contain expected files"));
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn detects_when_all_model_files_are_present() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("parakeet-server-test-present-{unique}"));
+
+        fs::create_dir_all(&root).unwrap();
+
+        for file_name in MODEL_FILES {
+            fs::write(root.join(file_name), format!("contents for {file_name}")).unwrap();
+        }
+
+        assert!(model_files_present(&root).await.unwrap());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn detects_when_a_model_file_is_missing() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("parakeet-server-test-absent-{unique}"));
+
+        fs::create_dir_all(&root).unwrap();
+
+        for file_name in &MODEL_FILES[..MODEL_FILES.len() - 1] {
+            fs::write(root.join(file_name), format!("contents for {file_name}")).unwrap();
+        }
+
+        assert!(!model_files_present(&root).await.unwrap());
 
         fs::remove_dir_all(&root).unwrap();
     }
