@@ -3,6 +3,7 @@ use std::io::Cursor;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Mutex;
+use std::time::Instant;
 
 use once_cell::sync::Lazy;
 use rocket::catch;
@@ -84,6 +85,12 @@ async fn transcribe(
     content_type: &ContentType,
     data: Data<'_>,
 ) -> Result<(ContentType, String), rocket::http::Status> {
+    let request_started = Instant::now();
+    log::info!(
+        "received transcription request: content_type={}",
+        content_type
+    );
+
     let mut options = MultipartFormDataOptions::new();
     options
         .allowed_fields
@@ -127,10 +134,25 @@ async fn transcribe(
         .unwrap_or("en")
         .to_string();
 
+    let file_name = file_field
+        .file_name
+        .clone()
+        .unwrap_or_else(|| "upload.bin".to_string());
+    let upload_size = file_field.raw.len();
+    log::info!(
+        "parsed transcription request: file_name={}, bytes={}, response_format={}, language={}",
+        file_name,
+        upload_size,
+        response_format,
+        language
+    );
+
+    log::info!("ensuring model files are present before transcription");
     let model_dir = ensure_model_present().await.map_err(|err| {
         log::error!("model preparation failed: {err}");
         rocket::http::Status::InternalServerError
     })?;
+    log::info!("model files ready at {}", model_dir.display());
 
     let extension = file_field
         .file_name
@@ -138,26 +160,49 @@ async fn transcribe(
         .and_then(|name| Path::new(name).extension())
         .and_then(|ext| ext.to_str())
         .map(|s| s.to_lowercase());
+    log::info!(
+        "preparing audio input: file_name={}, extension={}",
+        file_name,
+        extension.as_deref().unwrap_or("unknown")
+    );
 
     let decoded = if extension.as_deref() == Some("wav") {
+        log::info!("decoding wav input directly with symphonia");
         decode_audio_to_mono_f32(&file_field.raw, extension.as_deref()).map_err(|err| {
             log::error!("audio decode failed: {err}");
             rocket::http::Status::BadRequest
         })?
     } else {
+        log::info!("converting input to mono 16kHz wav via ffmpeg");
         convert_via_ffmpeg(&file_field.raw).await.map_err(|err| {
             log::error!("ffmpeg conversion failed: {err}");
             rocket::http::Status::BadRequest
         })?
     };
+    log::info!(
+        "decoded audio: sample_rate={}, samples={}",
+        decoded.sample_rate,
+        decoded.samples.len()
+    );
 
     let samples = if decoded.sample_rate == TARGET_SAMPLE_RATE {
+        log::info!("input already at target sample rate {}", TARGET_SAMPLE_RATE);
         decoded.samples
     } else {
+        log::info!(
+            "resampling audio from {}Hz to {}Hz",
+            decoded.sample_rate,
+            TARGET_SAMPLE_RATE
+        );
         resample_linear(&decoded.samples, decoded.sample_rate, TARGET_SAMPLE_RATE)
     };
 
     let duration = samples.len() as f64 / TARGET_SAMPLE_RATE as f64;
+    log::info!(
+        "running transcription: duration_seconds={:.2}, sample_count={}",
+        duration,
+        samples.len()
+    );
 
     let transcription = tokio::task::spawn_blocking(move || {
         let mut state = ENGINE_STATE
@@ -165,11 +210,15 @@ async fn transcribe(
             .map_err(|_| "engine lock poisoned".to_string())?;
 
         if !state.model_loaded {
+            log::info!("loading parakeet model into inference engine");
             state
                 .engine
                 .load_model_with_params(&model_dir, ParakeetModelParams::int8())
                 .map_err(|err| format!("failed to load parakeet model: {err}"))?;
             state.model_loaded = true;
+            log::info!("parakeet model loaded successfully");
+        } else {
+            log::info!("reusing already loaded parakeet model");
         }
 
         let params = ParakeetInferenceParams {
@@ -190,6 +239,17 @@ async fn transcribe(
         log::error!("transcription error: {err}");
         rocket::http::Status::InternalServerError
     })?;
+
+    log::info!(
+        "transcription complete: text_bytes={}, segments={}, elapsed_ms={}",
+        transcription.text.len(),
+        transcription
+            .segments
+            .as_ref()
+            .map(|segments| segments.len())
+            .unwrap_or(0),
+        request_started.elapsed().as_millis()
+    );
 
     Ok(format_openai_response(
         response_format,
@@ -559,7 +619,8 @@ fn internal_error() -> Json<OpenAiErrorResponse> {
 
 #[launch]
 fn rocket() -> Rocket<Build> {
-    env_logger::init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    log::info!("starting parakeet-server with default log level info");
     rocket::build()
         .mount("/", routes![index, transcribe])
         .register("/", rocket::catchers![bad_request, internal_error])

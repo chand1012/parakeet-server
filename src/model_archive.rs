@@ -16,7 +16,9 @@ const MODEL_FILES: [&str; 5] = [
 
 pub async fn ensure_model_present() -> Result<PathBuf, String> {
     let model_dir = PathBuf::from(MODEL_DIR);
+    log::info!("checking model directory {}", model_dir.display());
     if model_files_present(&model_dir).await? {
+        log::info!("all required model files already exist, skipping download");
         return Ok(model_dir);
     }
 
@@ -35,7 +37,11 @@ pub async fn ensure_model_present() -> Result<PathBuf, String> {
     let archive_path = parent_dir.join("parakeet-v3-int8.tar.gz.part");
     let extract_dir = parent_dir.join("parakeet-v3-int8.extracting");
 
-    log::info!("downloading model archive from {}", MODEL_ARCHIVE_URL);
+    log::info!(
+        "model files missing, downloading archive from {} to {}",
+        MODEL_ARCHIVE_URL,
+        archive_path.display()
+    );
 
     let response = client
         .get(MODEL_ARCHIVE_URL)
@@ -50,9 +56,13 @@ pub async fn ensure_model_present() -> Result<PathBuf, String> {
         .map_err(|err| format!("failed to create {}: {err}", archive_path.display()))?;
 
     let mut stream = response.bytes_stream();
+    let mut total_bytes = 0usize;
+    let mut chunk_count = 0usize;
     while let Some(chunk_result) = stream.next().await {
         let chunk =
             chunk_result.map_err(|err| format!("stream read failed for model archive: {err}"))?;
+        chunk_count += 1;
+        total_bytes += chunk.len();
         out.write_all(&chunk)
             .await
             .map_err(|err| format!("write failed for {}: {err}", archive_path.display()))?;
@@ -61,6 +71,12 @@ pub async fn ensure_model_present() -> Result<PathBuf, String> {
     out.flush()
         .await
         .map_err(|err| format!("flush failed for {}: {err}", archive_path.display()))?;
+    log::info!(
+        "downloaded model archive: bytes={}, chunks={}, path={}",
+        total_bytes,
+        chunk_count,
+        archive_path.display()
+    );
 
     if tokio::fs::try_exists(&extract_dir).await.map_err(|err| {
         format!(
@@ -68,6 +84,10 @@ pub async fn ensure_model_present() -> Result<PathBuf, String> {
             extract_dir.display()
         )
     })? {
+        log::info!(
+            "removing previous temporary extraction directory {}",
+            extract_dir.display()
+        );
         tokio::fs::remove_dir_all(&extract_dir)
             .await
             .map_err(|err| {
@@ -85,19 +105,41 @@ pub async fn ensure_model_present() -> Result<PathBuf, String> {
                 extract_dir.display()
             )
         })?;
+    log::info!(
+        "created temporary extraction directory {}",
+        extract_dir.display()
+    );
 
     let archive_path_for_extract = archive_path.clone();
     let extract_dir_for_extract = extract_dir.clone();
     let model_dir_for_extract = model_dir.clone();
     tokio::task::spawn_blocking(move || {
+        log::info!(
+            "extracting model archive {} into {}",
+            archive_path_for_extract.display(),
+            extract_dir_for_extract.display()
+        );
         extract_model_archive(&archive_path_for_extract, &extract_dir_for_extract)?;
+        log::info!(
+            "installing extracted model files into {}",
+            model_dir_for_extract.display()
+        );
         install_model_files(&extract_dir_for_extract, &model_dir_for_extract)
     })
     .await
     .map_err(|err| format!("model extraction task failed: {err}"))??;
 
+    log::info!("cleaning up temporary archive {}", archive_path.display());
     let _ = tokio::fs::remove_file(&archive_path).await;
+    log::info!(
+        "cleaning up temporary extraction directory {}",
+        extract_dir.display()
+    );
     let _ = tokio::fs::remove_dir_all(&extract_dir).await;
+    log::info!(
+        "model archive preparation complete: {}",
+        model_dir.display()
+    );
 
     Ok(model_dir)
 }
@@ -109,10 +151,12 @@ async fn model_files_present(model_dir: &Path) -> Result<bool, String> {
             .await
             .map_err(|err| format!("failed to stat model file {}: {err}", file_path.display()))?
         {
+            log::info!("missing model file {}", file_path.display());
             return Ok(false);
         }
     }
 
+    log::info!("verified required model files in {}", model_dir.display());
     Ok(true)
 }
 
@@ -128,6 +172,7 @@ fn extract_model_archive(archive_path: &Path, extract_dir: &Path) -> Result<(), 
         .entries()
         .map_err(|err| format!("failed to read archive entries: {err}"))?;
 
+    let mut extracted_entries = 0usize;
     for entry in entries {
         let mut entry = entry.map_err(|err| format!("failed to read archive entry: {err}"))?;
         let relative_path = sanitized_archive_path(
@@ -143,6 +188,7 @@ fn extract_model_archive(archive_path: &Path, extract_dir: &Path) -> Result<(), 
         if entry.header().entry_type().is_dir() {
             std::fs::create_dir_all(&destination)
                 .map_err(|err| format!("failed to create {}: {err}", destination.display()))?;
+            log::info!("created extracted directory {}", destination.display());
             continue;
         }
 
@@ -154,13 +200,26 @@ fn extract_model_archive(archive_path: &Path, extract_dir: &Path) -> Result<(), 
         entry
             .unpack(&destination)
             .map_err(|err| format!("failed to unpack {}: {err}", destination.display()))?;
+        extracted_entries += 1;
+        log::info!("extracted archive file {}", destination.display());
     }
+
+    log::info!(
+        "finished extracting archive {} into {} with {} files",
+        archive_path.display(),
+        extract_dir.display(),
+        extracted_entries
+    );
 
     Ok(())
 }
 
 fn install_model_files(extract_dir: &Path, model_dir: &Path) -> Result<(), String> {
     let source_dir = find_model_root(extract_dir)?;
+    log::info!(
+        "using extracted model root {} for final install",
+        source_dir.display()
+    );
     std::fs::create_dir_all(model_dir)
         .map_err(|err| format!("failed to create model dir {}: {err}", model_dir.display()))?;
 
@@ -186,6 +245,11 @@ fn install_model_files(extract_dir: &Path, model_dir: &Path) -> Result<(), Strin
                 tmp_path.display()
             )
         })?;
+        log::info!(
+            "copied model file {} to temporary path {}",
+            source_path.display(),
+            tmp_path.display()
+        );
         std::fs::rename(&tmp_path, &destination_path).map_err(|err| {
             format!(
                 "failed to rename {} to {}: {err}",
@@ -193,6 +257,7 @@ fn install_model_files(extract_dir: &Path, model_dir: &Path) -> Result<(), Strin
                 destination_path.display()
             )
         })?;
+        log::info!("installed model file {}", destination_path.display());
     }
 
     Ok(())
@@ -206,6 +271,7 @@ fn find_model_root(root: &Path) -> Result<PathBuf, String> {
             .iter()
             .all(|file_name| path.join(file_name).is_file())
         {
+            log::info!("found model root candidate {}", path.display());
             return Ok(path);
         }
 
