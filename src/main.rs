@@ -1,4 +1,4 @@
-use parakeet_server::model_archive::ensure_model_present;
+use parakeet_server::model_archive::{ensure_model_present, model_dir};
 use std::io::Cursor;
 use std::path::Path;
 use std::process::Stdio;
@@ -8,6 +8,7 @@ use std::time::Instant;
 use once_cell::sync::Lazy;
 use rocket::catch;
 use rocket::data::Data;
+use rocket::fairing::AdHoc;
 use rocket::fs::NamedFile;
 use rocket::http::ContentType;
 use rocket::serde::json::Json;
@@ -147,11 +148,7 @@ async fn transcribe(
         language
     );
 
-    log::info!("ensuring model files are present before transcription");
-    let model_dir = ensure_model_present().await.map_err(|err| {
-        log::error!("model preparation failed: {err}");
-        rocket::http::Status::InternalServerError
-    })?;
+    let model_dir = model_dir();
     log::info!("model files ready at {}", model_dir.display());
 
     let extension = file_field
@@ -622,6 +619,25 @@ fn rocket() -> Rocket<Build> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     log::info!("starting parakeet-server with default log level info");
     rocket::build()
+        .attach(AdHoc::try_on_ignite(
+            "Prepare model archive",
+            |rocket| async move {
+                log::info!("ensuring parakeet model is present during startup");
+                match ensure_model_present().await {
+                    Ok(model_dir) => {
+                        log::info!(
+                            "startup model preparation complete: {}",
+                            model_dir.display()
+                        );
+                        Ok(rocket)
+                    }
+                    Err(err) => {
+                        log::error!("startup model preparation failed: {err}");
+                        Err(rocket)
+                    }
+                }
+            },
+        ))
         .mount("/", routes![index, transcribe])
         .register("/", rocket::catchers![bad_request, internal_error])
 }

@@ -14,8 +14,12 @@ const MODEL_FILES: [&str; 5] = [
     "config.json",
 ];
 
+pub fn model_dir() -> PathBuf {
+    PathBuf::from(MODEL_DIR)
+}
+
 pub async fn ensure_model_present() -> Result<PathBuf, String> {
-    let model_dir = PathBuf::from(MODEL_DIR);
+    let model_dir = model_dir();
     log::info!("checking model directory {}", model_dir.display());
     if model_files_present(&model_dir).await? {
         log::info!("all required model files already exist, skipping download");
