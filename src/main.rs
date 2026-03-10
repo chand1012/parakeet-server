@@ -289,23 +289,44 @@ async fn convert_via_ffmpeg(bytes: &[u8]) -> Result<DecodedAudio, String> {
         .spawn()
         .map_err(|err| format!("failed to spawn ffmpeg: {err}"))?;
 
-    if let Some(mut stdin) = child.stdin.take() {
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "failed to acquire ffmpeg stdin".to_string())?;
+    let input = bytes.to_vec();
+    let stdin_task = tokio::spawn(async move {
         stdin
-            .write_all(bytes)
+            .write_all(&input)
             .await
             .map_err(|err| format!("write to ffmpeg stdin failed: {err}"))?;
-        // drop stdin to close the pipe and signal EOF to ffmpeg
-    }
+        stdin
+            .shutdown()
+            .await
+            .map_err(|err| format!("failed to close ffmpeg stdin: {err}"))
+    });
 
     let output = child
         .wait_with_output()
         .await
         .map_err(|err| format!("ffmpeg wait failed: {err}"))?;
+    let stdin_result = stdin_task
+        .await
+        .map_err(|err| format!("ffmpeg stdin task failed: {err}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ffmpeg failed: {stderr}"));
+        return match stdin_result {
+            Ok(()) => Err(format!("ffmpeg failed: {stderr}")),
+            Err(stdin_err) if stderr.trim().is_empty() => {
+                Err(format!("ffmpeg failed and stdin write failed: {stdin_err}"))
+            }
+            Err(stdin_err) => Err(format!(
+                "ffmpeg failed: {stderr}; stdin write also failed: {stdin_err}"
+            )),
+        };
     }
+
+    stdin_result?;
 
     let raw = output.stdout;
     if raw.len() % 4 != 0 {
