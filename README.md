@@ -1,54 +1,74 @@
 # parakeet-server
 
-A self-hosted, OpenAI-compatible speech-to-text API server powered by NVIDIA's [Parakeet TDT 0.6B](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) model. Drop-in replacement for the Whisper API — point any Whisper-compatible client at it and start transcribing.
+A self-hosted, OpenAI-compatible speech-to-text API powered by NVIDIA's [Parakeet TDT 0.6B v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) model.
 
-## Features
+Point Whisper-compatible clients at this server and keep everything local.
 
-- **OpenAI Whisper API compatible** — works with existing clients (e.g. `openai-python`, `whisper.cpp` clients, etc.)
-- **Multiple output formats** — `json`, `text`, `srt`, `vtt`, `verbose_json`
-- **Automatic model download** — model archive fetched and extracted automatically on first run, no manual setup
-- **Browser UI** — built-in web interface for quick testing at `http://localhost:8000`
-- **Efficient inference** — INT8 quantized ONNX model via ONNX Runtime
-- **Supports many audio formats** — MP3, WAV, FLAC, OGG, and more (via Symphonia)
-- **Docker-ready** — multi-stage build with non-root user, minimal runtime image
+[![GHCR](https://img.shields.io/badge/GHCR-ghcr.io%2Fchand1012%2Fparakeet--server-2ea44f?logo=github&style=flat-square)](https://ghcr.io/chand1012/parakeet-server)
+[![Rocket](https://img.shields.io/badge/Rocket-0.5.1-blue?style=flat-square)](https://docs.rs/rocket/0.5.1/rocket/)
+[![License](https://img.shields.io/github/license/chand1012/parakeet-server?color=blue&style=flat-square)](LICENSE)
 
-## Quick Start
+## Why this project
 
-### Docker (recommended)
+- OpenAI Whisper API compatible endpoint: `POST /v1/audio/transcriptions`
+- Automatic model download and local caching on first use
+- Multiple response formats: `json`, `text`, `srt`, `vtt`, `verbose_json`
+- Built-in browser UI at `http://localhost:8000`
+- Docker-friendly deployment and Rust-native runtime
+
+## Quick start
+
+### Option 1: Run from GHCR image
 
 ```bash
-docker build -t parakeet-server:latest .
-bash run.sh
+docker pull ghcr.io/chand1012/parakeet-server:latest
+docker run --rm -it \
+  -p 8000:8000 \
+  -v "$(pwd)/models:/home/parakeet/models" \
+  ghcr.io/chand1012/parakeet-server:latest
 ```
 
-The server will start on `http://localhost:8000`. Model files (~300 MB) are downloaded automatically on first transcription and cached in `./models/`.
+### Option 2: Build and run locally
 
-### From Source
-
-**Prerequisites:** Rust 1.93+, `cmake`, `protobuf-compiler`, `libssl-dev`, `pkg-config`
+Prerequisites: Rust 1.93+, `cmake`, `protobuf-compiler`, `pkg-config`, OpenSSL dev libs.
 
 ```bash
 cargo build --release
 ./target/release/parakeet-server
 ```
 
-## API Usage
+Server starts on `http://localhost:8000`.
 
-### Transcribe Audio
+## Docker Compose (modern)
 
+```yaml
+name: parakeet
+
+services:
+  app:
+    image: ghcr.io/chand1012/parakeet-server:latest
+    pull_policy: always
+    init: true
+    container_name: parakeet-server
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      ROCKET_PORT: "8000"
+      RUST_LOG: info
+    volumes:
+      - ./models:/home/parakeet/models
 ```
-POST /v1/audio/transcriptions
-Content-Type: multipart/form-data
+
+Then run:
+
+```bash
+docker compose up -d
 ```
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `file` | file | Yes | Audio file (≤ 100 MB) |
-| `model` | string | No | Model name (default: `whisper-1`) |
-| `response_format` | string | No | `json` (default), `text`, `srt`, `vtt`, `verbose_json` |
-| `language` | string | No | Language code (default: `en`) |
+## API usage
 
-**Example with curl:**
+### Basic transcription
 
 ```bash
 curl http://localhost:8000/v1/audio/transcriptions \
@@ -56,50 +76,55 @@ curl http://localhost:8000/v1/audio/transcriptions \
   -F model=whisper-1
 ```
 
-**JSON response:**
+### Optional form fields
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `file` | file | Yes | Audio upload (max 100 MB) |
+| `model` | string | No | Default: `whisper-1` |
+| `response_format` | string | No | `json` (default), `text`, `srt`, `vtt`, `verbose_json` |
+| `language` | string | No | Default: `en` |
+
+### Response examples
+
+`json`:
+
 ```json
 { "text": "Hello, world." }
 ```
 
-**Verbose JSON response** (includes segment timestamps):
+`verbose_json`:
+
 ```json
 {
+  "task": "transcribe",
+  "language": "en",
+  "duration": 1.5,
   "text": "Hello, world.",
   "segments": [
-    { "text": "Hello, world.", "start": 0.0, "end": 1.5 }
+    { "id": 0, "seek": 0, "start": 0.0, "end": 1.5, "text": "Hello, world." }
   ]
 }
 ```
 
-**SRT response:**
-```
+`srt`:
+
+```text
 1
 00:00:00,000 --> 00:00:01,500
 Hello, world.
 ```
 
-### Test Script
+## OpenAI client compatibility
 
-A convenience script is included for quick testing:
-
-```bash
-bash test_transcribe.sh path/to/audio.mp3
-```
-
-### Browser UI
-
-Open `http://localhost:8000` in your browser for the built-in transcription interface.
-
-## Using with OpenAI-Compatible Clients
-
-Point any Whisper API client at your server by overriding the base URL:
+Works with standard OpenAI SDKs by overriding `base_url`:
 
 ```python
 from openai import OpenAI
 
 client = OpenAI(
     api_key="not-needed",
-    base_url="http://localhost:8000/v1"
+    base_url="http://localhost:8000/v1",
 )
 
 with open("audio.mp3", "rb") as f:
@@ -111,44 +136,45 @@ with open("audio.mp3", "rb") as f:
 print(result.text)
 ```
 
-## Model
+## Browser UI
 
-Uses the **NVIDIA Parakeet TDT 0.6B v3** model (INT8 quantized):
+Open `http://localhost:8000` and upload an audio file to test transcription in the built-in web interface.
 
-| Property | Value |
-|----------|-------|
-| Architecture | NeMo Conformer with Transducer Decoder (TDT) |
-| Parameters | ~600M (INT8 quantized) |
-| Input | 16 kHz mono audio (auto-resampled) |
-| Source | [nvidia/parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) |
+## Model and processing details
 
-Model files are stored in `models/parakeet-tdt-0.6b-v3-int8/` and extracted automatically from `https://blob.handy.computer/parakeet-v3-int8.tar.gz` on first use.
+- Model: **NVIDIA Parakeet TDT 0.6B v3 (INT8)**
+- Runtime: ONNX Runtime via `transcribe-rs`
+- Audio decoding: Symphonia and ffmpeg fallback path
+- Target sample rate: 16 kHz mono
+- Model cache path: `models/parakeet-tdt-0.6b-v3-int8/`
 
-## Configuration
+On first use, the model archive is fetched automatically from:
 
-| Setting | Default | Notes |
-|---------|---------|-------|
-| Port | `8000` | Set by Rocket / exposed in Docker |
-| Model directory | `models/parakeet-tdt-0.6b-v3-int8/` | Relative to working directory |
-| Max file size | 100 MB | Enforced on upload |
-| Sample rate | 16 kHz | Input audio is resampled automatically |
+- `https://blob.handy.computer/parakeet-v3-int8.tar.gz`
 
-## Docker Details
-
-The image uses a two-stage build to keep the runtime image small:
-
-1. **Builder** (`rust:1.93`) — compiles the binary and ONNX Runtime from source
-2. **Runtime** (`debian:bookworm-slim`) — minimal image with only the required shared libraries
-
-The container runs as a non-root user (`parakeet`, UID 1000). The `run.sh` script mounts `./models` into the container so downloaded model files persist between runs:
+## Development
 
 ```bash
-docker run --rm -it \
-  -p 8000:8000 \
-  -v "$(pwd)/models:/home/parakeet/models" \
-  parakeet-server:latest
+# build
+cargo build
+cargo build --release
+
+# test
+cargo test
+cargo test <test_function_name>
+
+# lint / format
+cargo fmt --check
+cargo fmt
+cargo clippy
+```
+
+There is also a helper script for manual endpoint testing:
+
+```bash
+bash test_transcribe.sh path/to/audio.mp3
 ```
 
 ## License
 
-See [LICENSE](LICENSE).
+MIT. See `LICENSE`.
