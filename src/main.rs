@@ -81,6 +81,11 @@ struct OpenAiErrorResponse {
     error: OpenAiErrorBody,
 }
 
+#[derive(Serialize)]
+struct HealthResponse {
+    status: String,
+}
+
 #[post("/v1/audio/transcriptions", data = "<data>")]
 async fn transcribe(
     content_type: &ContentType,
@@ -260,6 +265,13 @@ async fn transcribe(
 #[get("/")]
 async fn index() -> Option<NamedFile> {
     NamedFile::open("static/index.html").await.ok()
+}
+
+#[get("/health")]
+async fn health() -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "ok".to_string(),
+    })
 }
 
 struct DecodedAudio {
@@ -659,6 +671,6 @@ fn rocket() -> Rocket<Build> {
                 }
             },
         ))
-        .mount("/", routes![index, transcribe])
+        .mount("/", routes![index, transcribe, health])
         .register("/", rocket::catchers![bad_request, internal_error])
 }
