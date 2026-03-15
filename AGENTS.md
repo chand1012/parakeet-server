@@ -97,6 +97,47 @@ Use the `log` crate with appropriate log levels:
 - Add comments to explain complex logic or algorithmic decisions
 - Include examples in documentation where appropriate
 
+## Pull Request Guidelines
+
+### PR Title Format
+
+Start with an action verb in present tense:
+- "Add" for new features
+- "Update" or "Refactor" for modifications
+- "Fix" or "Remove" for bug fixes/cleanup
+- Example: "Add Parakeet Bench command for transcription performance benchmarking"
+
+### PR Description Format
+
+Use the following structure when creating a PR description:
+
+**Summary:** An explanation of what the PR does and why it's needed.
+
+**Key Changes:** A bulleted list of the specific modifications made (new files, modified files, key logic changes).
+
+**Testing Notes:** Technical details on how the changes were verified or tested. Include any manual steps required or inferred from the diff and commits.
+
+### Creating PRs with GitHub CLI
+
+Use `gh pr create` to create detailed PRs:
+
+```bash
+# Create new branch first if needed
+git checkout -b feature-name
+
+# Make changes, commit them
+git add . && git commit -m "Short commit message"
+
+# Create PR from terminal
+gh pr create --base master \
+  --title "Title here" \
+  --body $'## Summary\n\nDescription...\n\n## Key Changes\n\n- Change 1\n- Change 2\n\n## Testing Notes\n\nNotes...'
+```
+
+Then open in browser: `gh pr view --web`
+
+---
+
 ## Additional Configuration Files
 
 The project uses:
