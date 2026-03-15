@@ -175,6 +175,23 @@ There is also a helper script for manual endpoint testing:
 bash test_transcribe.sh path/to/audio.mp3
 ```
 
+### Benchmarking transcription performance
+
+Benchmarks throughput using the OpenSLR SLR81 test set with configurable parallel workers:
+
+```bash
+# Download test audio samples (~2.5GB)
+./download_samples.sh
+
+# Run benchmark (default: 4 parallel workers)
+parakeet-bench
+
+# Custom parallelism
+parakeet-bench -j 8
+```
+
+Reports files processed, average duration, and throughput (files/second).
+
 ## License
 
 MIT. See `LICENSE`.
